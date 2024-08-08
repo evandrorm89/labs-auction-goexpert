@@ -2,11 +2,14 @@ package auction
 
 import (
 	"context"
+	"fmt"
 	"fullcycle-auction_go/configuration/logger"
 	"fullcycle-auction_go/internal/entity/auction_entity"
 	"fullcycle-auction_go/internal/internal_error"
+	"fullcycle-auction_go/internal/usecase/bid_usecase"
 	"time"
 
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
@@ -23,15 +26,14 @@ type AuctionRepository struct {
 	Collection *mongo.Collection
 }
 
-type auctionBatch []auction_entity.Auction
+var auctionBatch []auction_entity.Auction
 
-type AuctionUpdateBatch struct {
-	AuctionRepository AuctionRepository
-
+type AuctionBatchManager struct {
+	AuctionRepository   *AuctionRepository
+	MaxBatchSize        int
+	BatchInsertInterval time.Duration
+	Batch               chan auction_entity.Auction
 	timer               *time.Timer
-	maxBatchSize        int
-	batchInsertInterval time.Duration
-	bidChannel          chan bid_entity.Bid
 }
 
 func NewAuctionRepository(database *mongo.Database) *AuctionRepository {
@@ -65,73 +67,19 @@ func CalculateAuctionTime(auctionTimestamp time.Time) time.Duration {
 	return time.Since(auctionTimestamp)
 }
 
-func prepareBatch() {
-	maxSizeInterval := getMaxBatchSizeInterval()
-	maxBatchSize := getMaxBatchSize()
+func NewAuctionBatchManager(ar *AuctionRepository) *AuctionBatchManager {
+	maxSizeInterval := bid_usecase.GetMaxBatchSizeInterval()
+	maxBatchSize := bid_usecase.GetMaxBatchSize()
 
-	bidUseCase := &BidUseCase{
-		BidRepository:       bidRepository,
-		maxBatchSize:        maxBatchSize,
-		batchInsertInterval: maxSizeInterval,
+	return &AuctionBatchManager{
+		AuctionRepository:   ar,
+		MaxBatchSize:        maxBatchSize,
+		BatchInsertInterval: maxSizeInterval,
 		timer:               time.NewTimer(maxSizeInterval),
-		bidChannel:          make(chan bid_entity.Bid, maxBatchSize),
 	}
-
-	bidUseCase.triggerCreateRoutine(context.Background())
-
 }
 
-func monitorAuctionExpiration(ctx context.Context, ar *AuctionRepository) {
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-}
-
-func closeAuction(ctx context.Context, ar *AuctionRepository, id string) {
-	filter := bson.M{"_id": id}
-	update := bson.M{"$set": bson.M{"status": auction_entity.Completed}}
-
-	result, err := ar.Collection.UpdateOne(ctx, filter, update)
-}
-
-func (au *AuctionUseCase) triggerCreateRoutine(ctx context.Context) {
-	go func() {
-		defer close(au.bidChannel)
-
-		for {
-			select {
-			case bidEntity, ok := <-au.bidChannel:
-				if !ok {
-					if len(auctionBatch) > 0 {
-						if err := au.BidRepository.CreateBid(ctx, auctionBatch); err != nil {
-							logger.Error("error trying to process bid batch list", err)
-						}
-					}
-					return
-				}
-
-				auctionBatch = append(auctionBatch, auctionEntity)
-
-				if len(auctionBatch) >= au.maxBatchSize {
-					if err := au.BidRepository.CreateBid(ctx, auctionBatch); err != nil {
-						logger.Error("error trying to process bid batch list", err)
-					}
-
-					auctionBatch = nil
-					au.timer.Reset(au.batchInsertInterval)
-				}
-			case <-au.timer.C:
-				if err := au.BidRepository.CreateBid(ctx, auctionBatch); err != nil {
-					logger.Error("error trying to process bid batch list", err)
-				}
-				auctionBatch = nil
-				au.timer.Reset(au.batchInsertInterval)
-			}
-		}
-	}()
-
-}
-
-func fetchActiveAuctions(ctx context.Context, ar *AuctionRepository) *internal_error.InternalError {
+func fetchActiveAuctions(ctx context.Context, ar *AuctionRepository, abm *AuctionBatchManager) *internal_error.InternalError {
 	var status auction_entity.AuctionStatus = auction_entity.Active
 	auctions, err := ar.FindAuctions(ctx, status, "", "")
 	if err != nil {
@@ -139,8 +87,77 @@ func fetchActiveAuctions(ctx context.Context, ar *AuctionRepository) *internal_e
 		return internal_error.NewInternalServerError("Error trying to fetch active auctions")
 	}
 	for _, auction := range auctions {
-		if CalculateAuctionTime(auction.Timestamp) > time.Second {
-			prepareBatch()
+		if CalculateAuctionTime(auction.Timestamp) > time.Hour {
+			abm.addAuction(ctx, auction)
 		}
 	}
+
+	return nil
+}
+
+// adds an auction to the batch channel
+func (abm *AuctionBatchManager) addAuction(ctx context.Context, auction auction_entity.Auction) {
+	abm.Batch <- auction
+}
+
+func (abm *AuctionBatchManager) Run(ctx context.Context) {
+	go func() {
+		defer close(abm.Batch)
+		for {
+			select {
+			case auction, ok := <-abm.Batch:
+				if !ok {
+					if len(auctionBatch) > 0 {
+						if err := abm.processBatch(ctx); err != nil {
+							logger.Error("Error processing batch", err)
+						}
+					}
+					return
+				}
+
+				auctionBatch = append(auctionBatch, auction)
+				if len(auctionBatch) >= abm.MaxBatchSize {
+					if err := abm.processBatch(ctx); err != nil {
+						logger.Error("Error processing batch", err)
+					}
+
+					auctionBatch = nil
+					abm.timer.Reset(abm.BatchInsertInterval)
+				}
+			case <-abm.timer.C:
+				if err := abm.processBatch(ctx); err != nil {
+					logger.Error("Error processing batch", err)
+				}
+
+				auctionBatch = nil
+				abm.timer.Reset(abm.BatchInsertInterval)
+			}
+
+		}
+	}()
+}
+
+func (abm *AuctionBatchManager) processBatch(ctx context.Context) *internal_error.InternalError {
+	// update the auctions in the batch
+	filter := bson.M{"_id": bson.M{"$in": getAuctionIds(auctionBatch)}}
+	update := bson.M{"$set": bson.M{"status": auction_entity.Completed}}
+
+	result, err := abm.AuctionRepository.Collection.UpdateMany(ctx, filter, update)
+	if err != nil {
+		logger.Error("Error updating auction statuses", err)
+		return internal_error.NewInternalServerError("Error updating auction statuses")
+	}
+
+	logger.Info(fmt.Sprintf("Updated %d auctions", result.ModifiedCount))
+	abm.Batch = nil
+
+	return nil
+}
+
+func getAuctionIds(auction []auction_entity.Auction) []string {
+	var ids []string
+	for _, a := range auction {
+		ids = append(ids, a.Id)
+	}
+	return ids
 }

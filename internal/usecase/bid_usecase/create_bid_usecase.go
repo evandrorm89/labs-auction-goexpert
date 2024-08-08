@@ -34,8 +34,8 @@ type BidUseCase struct {
 }
 
 func NewBidUseCase(bidRepository bid_entity.BidEntityRepository) BidUseCaseInterface {
-	maxSizeInterval := getMaxBatchSizeInterval()
-	maxBatchSize := getMaxBatchSize()
+	maxSizeInterval := GetMaxBatchSizeInterval()
+	maxBatchSize := GetMaxBatchSize()
 
 	bidUseCase := &BidUseCase{
 		BidRepository:       bidRepository,
@@ -115,7 +115,7 @@ func (bu *BidUseCase) CreateBid(
 	return nil
 }
 
-func getMaxBatchSizeInterval() time.Duration {
+func GetMaxBatchSizeInterval() time.Duration {
 	batchInsertInterval := os.Getenv("BATCH_INSERT_INTERVAL")
 	duration, err := time.ParseDuration(batchInsertInterval)
 	if err != nil {
@@ -125,7 +125,7 @@ func getMaxBatchSizeInterval() time.Duration {
 	return duration
 }
 
-func getMaxBatchSize() int {
+func GetMaxBatchSize() int {
 	value, err := strconv.Atoi(os.Getenv("MAX_BATCH_SIZE"))
 	if err != nil {
 		return 5
